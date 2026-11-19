@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main, filter-plugin]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build the plugin
+        id: build
+        uses: ./.github/actions/build-plugin # zizmor: ignore[self-repository] actionlint 1.7.12 rejects the $/ form
+
+      - name: Run the tests
+        shell: bash -el {0}
+        env:
+          HDF5_PLUGIN_PATH: ${{ steps.build.outputs.plugin-dir }}
+        run: python -m pytest tests -v
+
+  lint-workflows:
+    name: Lint workflows
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install actionlint and zizmor
+        uses: mamba-org/setup-micromamba@f457c30a868e4760d3a6fcea5f25dc655b8edf39 # v3.2.1
+        with:
+          environment-name: lint
+          create-args: actionlint zizmor
+          condarc: |
+            channels:
+              - conda-forge
+          init-shell: bash
+          post-cleanup: none
+
+      - name: Run actionlint
+        shell: bash -el {0}
+        run: actionlint
+
+      - name: Run zizmor
+        shell: bash -el {0}
+        run: zizmor --offline .github

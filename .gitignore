@@ -1,0 +1,8 @@
+/build/
+/install/
+/libojph-src/
+/libojph-build/
+/libojph-install/
+/dist/
+__pycache__/
+.pytest_cache/

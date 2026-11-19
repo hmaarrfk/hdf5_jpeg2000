@@ -1,0 +1,79 @@
+name: Release build
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x86_64
+          - os: ubuntu-24.04-arm
+            platform: linux-aarch64
+          - os: macos-latest
+            platform: macos-arm64
+          - os: windows-latest
+            platform: windows-x86_64
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build the plugin
+        id: build
+        uses: ./.github/actions/build-plugin # zizmor: ignore[self-repository] actionlint 1.7.12 rejects the $/ form
+
+      - name: Run the tests
+        shell: bash -el {0}
+        env:
+          HDF5_PLUGIN_PATH: ${{ steps.build.outputs.plugin-dir }}
+        run: python -m pytest tests -v
+
+      - name: Package the plugin
+        id: package
+        shell: bash -el {0}
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          PLUGIN_DIR: ${{ steps.build.outputs.plugin-dir }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          name="h5jpeg2000-${TAG}-${PLATFORM}"
+          mkdir -p "dist/${name}/plugin"
+          cp "$PLUGIN_DIR"/* "dist/${name}/plugin/"
+          cp README.md "dist/${name}/"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          echo "archive=dist/${name}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+
+      - name: Attest the build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.build.outputs.plugin-dir }}/*
+
+      - name: Upload the archive
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
