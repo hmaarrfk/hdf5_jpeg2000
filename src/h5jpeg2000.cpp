@@ -28,10 +28,9 @@ constexpr unsigned format_version = 1;
 constexpr unsigned type_size_mask = 0xFF;
 constexpr unsigned type_signed = 0x80;
 constexpr unsigned type_big_endian = 0x100;
-constexpr unsigned layout_single = 0;
-constexpr unsigned layout_interleaved = 1;
-constexpr unsigned layout_planar = 2;
-constexpr unsigned set_local_value_count = 5;
+constexpr uint32_t components_planar = 0x80000000u;
+constexpr uint32_t components_count_mask = 0x7FFFFFFFu;
+constexpr size_t value_count = 5;
 constexpr uint64_t maximum_components = 16384;
 constexpr uint64_t maximum_image_extent = 0xFFFFFFFFu;
 
@@ -110,52 +109,67 @@ struct image_geometry {
     uint64_t height;
     uint64_t width;
     uint64_t components;
+    bool planar;
 };
 
-bool image_geometry_from_chunk(const hsize_t *dims, int rank, unsigned layout, image_geometry &geometry,
+struct component_word {
+    uint64_t count;
+    bool planar;
+};
+
+component_word parse_component_word(uint32_t word, const char *&reason)
+{
+    component_word components{word & components_count_mask, (word & components_planar) != 0};
+    reason = nullptr;
+    if (components.planar && components.count == 0)
+        reason = "cd_values[4] = 0x80000000: the planar flag needs a component count";
+    else if (components.count > maximum_components)
+        reason = "cd_values[4]: a JPEG 2000 codestream holds at most 16384 components";
+    return components;
+}
+
+bool image_geometry_from_chunk(const hsize_t *dims, int rank, uint32_t word, image_geometry &geometry,
                                const char *&reason)
 {
-    std::vector<uint64_t> image_dims;
+    component_word components = parse_component_word(word, reason);
+    if (reason != nullptr)
+        return false;
     geometry.components = 1;
+    geometry.planar = components.planar;
     int first_image_axis = 0;
     int last_image_axis = rank;
-    if (layout == layout_interleaved) {
-        if (rank < 1) {
-            reason = "layout 1 needs a chunk with at least one axis";
+    if (components.count > 1 && !components.planar) {
+        if (rank < 1 || dims[rank - 1] != components.count) {
+            reason = "the last chunk axis is not the component count in cd_values[4]";
             return false;
         }
-        geometry.components = dims[rank - 1];
+        geometry.components = components.count;
         last_image_axis = rank - 1;
     }
-    else if (layout == layout_planar) {
+    else if (components.count > 1) {
         while (first_image_axis < rank && dims[first_image_axis] == 1)
             ++first_image_axis;
-        if (first_image_axis < rank) {
-            geometry.components = dims[first_image_axis];
-            ++first_image_axis;
+        if (first_image_axis == rank || dims[first_image_axis] != components.count) {
+            reason = "the first chunk axis that is not 1 is not the planar component count in cd_values[4]";
+            return false;
         }
+        geometry.components = components.count;
+        ++first_image_axis;
     }
-    else if (layout != layout_single) {
-        reason = "the layout, cd_values[2], must be 0, 1 or 2";
-        return false;
-    }
+    std::vector<uint64_t> image_dims;
     for (int axis = first_image_axis; axis < last_image_axis; ++axis)
         if (dims[axis] > 1)
             image_dims.push_back(dims[axis]);
     if (image_dims.size() > 2) {
-        reason = layout == layout_single
-                     ? "more than two chunk axes are larger than 1; chunk every axis but the image's height, "
-                       "width and components with size 1, and put the components on the last axis"
-                     : "more than two chunk axes besides the component axis are larger than 1; chunk every "
-                       "other axis with size 1";
+        reason = components.count > 1
+                     ? "more than two chunk axes besides the component axis are larger than 1; chunk every "
+                       "other axis with size 1"
+                     : "more than two chunk axes are larger than 1; chunk every axis but the image's height, "
+                       "width and components with size 1, and put the components on the last axis";
         return false;
     }
     geometry.height = image_dims.size() == 2 ? image_dims[0] : 1;
     geometry.width = image_dims.empty() ? 1 : image_dims.back();
-    if (geometry.components > maximum_components) {
-        reason = "a JPEG 2000 codestream holds at most 16384 components";
-        return false;
-    }
     if (geometry.height > maximum_image_extent || geometry.width > maximum_image_extent) {
         reason = "the image is larger than 2^32 - 1 samples along an axis";
         return false;
@@ -215,6 +229,10 @@ herr_t set_local(hid_t dcpl_id, hid_t type_id, hid_t space_id)
                      code);
         return -1;
     }
+    if (given_count > value_count) {
+        FILTER_ERROR(H5E_BADVALUE, "version 1 has %zu cd_values, %zu were given", value_count, given_count);
+        return -1;
+    }
 
     int rank = H5Sget_simple_extent_ndims(space_id);
     if (rank < 0 || rank > H5S_MAX_RANK) {
@@ -227,28 +245,37 @@ herr_t set_local(hid_t dcpl_id, hid_t type_id, hid_t space_id)
         return -1;
     }
 
-    unsigned layout = layout_single;
-    if (given_count >= 3)
-        layout = given[2];
+    uint32_t word = 0;
+    if (given_count >= 5)
+        word = given[4];
     else {
         int larger_than_one = 0;
         for (int axis = 0; axis < rank; ++axis)
             larger_than_one += dims[axis] > 1;
         if (larger_than_one == 3 && dims[rank - 1] > 1)
-            layout = layout_interleaved;
+            word = static_cast<uint32_t>(dims[rank - 1]);
     }
 
     image_geometry geometry{};
     const char *reason = "";
-    if (!image_geometry_from_chunk(dims, rank, layout, geometry, reason)) {
-        FILTER_ERROR(H5E_BADVALUE, "cannot store chunks with layout %u: %s", layout, reason);
+    if (!image_geometry_from_chunk(dims, rank, word, geometry, reason)) {
+        FILTER_ERROR(H5E_BADVALUE, "cannot store chunks with cd_values[4] = 0x%X: %s", word, reason);
+        return -1;
+    }
+    if (given_count >= 3 && given[2] != geometry.width) {
+        FILTER_ERROR(H5E_BADVALUE, "cd_values[2] = %u does not match the chunk's image width, %llu", given[2],
+                     static_cast<unsigned long long>(geometry.width));
+        return -1;
+    }
+    if (given_count >= 4 && given[3] != geometry.height) {
+        FILTER_ERROR(H5E_BADVALUE, "cd_values[3] = %u does not match the chunk's image height, %llu", given[3],
+                     static_cast<unsigned long long>(geometry.height));
         return -1;
     }
 
-    unsigned values[set_local_value_count] = {format_version, code, layout,
-                                              static_cast<unsigned>(geometry.height),
-                                              static_cast<unsigned>(geometry.width)};
-    if (H5Pmodify_filter(dcpl_id, jpeg2000_filter_id, flags, set_local_value_count, values) < 0) {
+    unsigned values[value_count] = {format_version, code, static_cast<unsigned>(geometry.width),
+                                    static_cast<unsigned>(geometry.height), word};
+    if (H5Pmodify_filter(dcpl_id, jpeg2000_filter_id, flags, value_count, values) < 0) {
         FILTER_ERROR(H5E_CANTSET, "cannot store the filter's cd_values");
         return -1;
     }
@@ -308,10 +335,9 @@ void minimum_and_maximum(unsigned bit_depth, bool is_signed, int64_t &minimum, i
     }
 }
 
-size_t sample_offset(unsigned layout, uint64_t row, uint64_t column, uint64_t component,
-                     const image_geometry &geometry)
+size_t sample_offset(uint64_t row, uint64_t column, uint64_t component, const image_geometry &geometry)
 {
-    if (layout == layout_planar)
+    if (geometry.planar)
         return static_cast<size_t>((component * geometry.height + row) * geometry.width + column);
     return static_cast<size_t>((row * geometry.width + column) * geometry.components + component);
 }
@@ -325,11 +351,10 @@ uint64_t checked_product(uint64_t a, uint64_t b)
 
 size_t decode(size_t cd_nelmts, const unsigned cd_values[], size_t nbytes, size_t *buf_size, void **buf)
 {
-    bool have_values = cd_nelmts > 0;
-    if (have_values && cd_values[0] != format_version)
+    if (cd_nelmts != 0 && cd_nelmts != 2 && cd_nelmts != value_count)
+        fail("version 1 has 0, 2 or 5 cd_values, the dataset has %zu", cd_nelmts);
+    if (cd_nelmts != 0 && cd_values[0] != format_version)
         fail("cd_values[0] = %u; this filter reads version %u", cd_values[0], format_version);
-    if (have_values && cd_nelmts < 3)
-        fail("version 1 needs at least 3 cd_values, the chunk has %zu", cd_nelmts);
 
     ojph::mem_infile file;
     file.open(static_cast<const ojph::ui8 *>(*buf), nbytes);
@@ -337,7 +362,7 @@ size_t decode(size_t cd_nelmts, const unsigned cd_values[], size_t nbytes, size_
     codestream.read_headers(&file);
     ojph::param_siz siz = codestream.access_siz();
 
-    image_geometry geometry{siz.get_recon_height(0), siz.get_recon_width(0), siz.get_num_components()};
+    image_geometry geometry{siz.get_recon_height(0), siz.get_recon_width(0), siz.get_num_components(), false};
     unsigned bit_depth = siz.get_bit_depth(0);
     bool codestream_signed = siz.is_signed(0);
     for (ojph::ui32 component = 0; component < geometry.components; ++component) {
@@ -350,26 +375,33 @@ size_t decode(size_t cd_nelmts, const unsigned cd_values[], size_t nbytes, size_
     if (bit_depth < 1 || bit_depth > 32)
         fail("the codestream's bit depth is %u; this filter decodes 1 to 32 bits", bit_depth);
 
-    element_type type{};
-    unsigned layout = layout_single;
-    if (have_values) {
+    element_type type{bit_depth <= 8 ? 1u : bit_depth <= 16 ? 2u : 4u, codestream_signed, false};
+    uint64_t expected_components = 1;
+    if (cd_nelmts >= 2)
         type = parse_element_type(cd_values[1]);
-        layout = cd_values[2];
-        if (layout > layout_planar)
-            fail("cd_values[2] = %u; the layout must be 0, 1 or 2", layout);
+    if (cd_nelmts == value_count) {
+        if (cd_values[2] != geometry.width || cd_values[3] != geometry.height)
+            fail("the codestream is %llu wide and %llu high, but cd_values[2] and cd_values[3] say %u by %u",
+                 static_cast<unsigned long long>(geometry.width),
+                 static_cast<unsigned long long>(geometry.height), cd_values[2], cd_values[3]);
+        const char *reason = nullptr;
+        component_word components = parse_component_word(cd_values[4], reason);
+        if (reason != nullptr)
+            fail("%s", reason);
+        expected_components = std::max<uint64_t>(components.count, 1);
+        geometry.planar = components.planar;
     }
-    else
-        type = element_type{bit_depth <= 8 ? 1u : bit_depth <= 16 ? 2u : 4u, codestream_signed, false};
-    if (layout == layout_single && geometry.components != 1)
-        fail("the codestream has %llu components, but the dataset stores one (layout 0)",
-             static_cast<unsigned long long>(geometry.components));
+    if (geometry.components != expected_components)
+        fail("the codestream has %llu components, but the dataset stores %llu",
+             static_cast<unsigned long long>(geometry.components),
+             static_cast<unsigned long long>(expected_components));
     if (bit_depth > 8 * type.size)
         fail("the codestream's bit depth, %u, does not fit the dataset's %u-byte elements", bit_depth,
              type.size);
 
     uint64_t sample_count = checked_product(checked_product(geometry.height, geometry.width), geometry.components);
     size_t output_size = static_cast<size_t>(checked_product(sample_count, type.size));
-    hdf5_buffer output = allocate(output_size == 0 ? 1 : output_size);
+    hdf5_buffer output = allocate(output_size);
 
     int64_t codestream_minimum, codestream_maximum, type_minimum, type_maximum;
     minimum_and_maximum(bit_depth, codestream_signed, codestream_minimum, codestream_maximum);
@@ -393,7 +425,7 @@ size_t decode(size_t cd_nelmts, const unsigned cd_values[], size_t nbytes, size_
             int64_t value = unsigned_32_bit ? static_cast<int64_t>(static_cast<uint32_t>(samples[column]))
                                             : static_cast<int64_t>(samples[column]);
             value = std::min(std::max(value, minimum), maximum);
-            size_t offset = sample_offset(layout, row, column, component, geometry);
+            size_t offset = sample_offset(row, column, component, geometry);
             store_bits(output.get() + offset * type.size, static_cast<uint32_t>(value), type);
         }
     }
@@ -401,7 +433,7 @@ size_t decode(size_t cd_nelmts, const unsigned cd_values[], size_t nbytes, size_
 
     H5free_memory(*buf);
     *buf = output.release();
-    *buf_size = output_size == 0 ? 1 : output_size;
+    *buf_size = output_size;
     return output_size;
 }
 
@@ -416,24 +448,19 @@ ojph::ui32 default_decomposition_count(uint64_t height, uint64_t width)
 
 size_t encode(size_t cd_nelmts, const unsigned cd_values[], size_t nbytes, size_t *buf_size, void **buf)
 {
-    if (cd_nelmts < set_local_value_count || cd_values[0] != format_version)
-        fail("encoding needs the %u version-1 cd_values that the filter's set_local writes",
-             set_local_value_count);
+    if (cd_nelmts != value_count || cd_values[0] != format_version)
+        fail("encoding needs the %zu version-1 cd_values that the filter's set_local writes", value_count);
     element_type type = parse_element_type(cd_values[1]);
-    unsigned layout = cd_values[2];
-    if (layout > layout_planar)
-        fail("cd_values[2] = %u; the layout must be 0, 1 or 2", layout);
-    image_geometry geometry{cd_values[3], cd_values[4], 0};
-    uint64_t component_bytes = checked_product(checked_product(geometry.height, geometry.width), type.size);
-    if (component_bytes == 0 || nbytes % component_bytes != 0)
-        fail("the chunk has %zu bytes, not a multiple of the %llu-byte image", nbytes,
-             static_cast<unsigned long long>(component_bytes));
-    geometry.components = nbytes / component_bytes;
-    if (geometry.components > maximum_components)
-        fail("a JPEG 2000 codestream holds at most 16384 components");
-    if (layout == layout_single && geometry.components != 1)
-        fail("the chunk holds %llu images, but layout 0 stores one",
-             static_cast<unsigned long long>(geometry.components));
+    const char *reason = nullptr;
+    component_word components = parse_component_word(cd_values[4], reason);
+    if (reason != nullptr)
+        fail("%s", reason);
+    image_geometry geometry{cd_values[3], cd_values[2], std::max<uint64_t>(components.count, 1), components.planar};
+    uint64_t expected_bytes = checked_product(
+        checked_product(checked_product(geometry.height, geometry.width), geometry.components), type.size);
+    if (expected_bytes == 0 || nbytes != expected_bytes)
+        fail("the chunk has %zu bytes, but cd_values describe a %llu-byte image", nbytes,
+             static_cast<unsigned long long>(expected_bytes));
 
     ojph::codestream codestream;
     ojph::param_siz siz = codestream.access_siz();
@@ -473,7 +500,7 @@ size_t encode(size_t cd_nelmts, const unsigned cd_values[], size_t nbytes, size_
         uint64_t row = rows_done[component]++;
         ojph::si32 *samples = line->i32;
         for (uint64_t column = 0; column < geometry.width; ++column) {
-            size_t offset = sample_offset(layout, row, column, component, geometry);
+            size_t offset = sample_offset(row, column, component, geometry);
             samples[column] = static_cast<ojph::si32>(load_sample(input + offset * type.size, type));
         }
         line = codestream.exchange(line, component);

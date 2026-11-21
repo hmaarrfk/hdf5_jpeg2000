@@ -35,8 +35,9 @@ The codec is [OpenJPH](https://github.com/aous72/OpenJPH), through the
 ### `cd_values`
 
 A filter callback sees the chunk's bytes and the `cd_values`, never the
-dataset's type or shape. The `cd_values` therefore hold only what a decoder
-cannot read from the codestream.
+dataset's type or shape. The `cd_values` record what a decoder cannot read
+from the codestream (the element type and where the components are) and the
+image shape the filter's encoder needs.
 
 Version 1:
 
@@ -44,47 +45,63 @@ Version 1:
 |---------|---------|--------|
 | `cd[0]` | Format version | `1` |
 | `cd[1]` | Element type: `size_in_bytes`, `\| 0x80` if signed, `\| 0x100` if big-endian | see below |
-| `cd[2]` | Where the components are (the layout) | `0`, `1` or `2`, see below |
-| `cd[3]` | Image height (written by `set_local`, used only by the encoder) | chunk height |
-| `cd[4]` | Image width (written by `set_local`, used only by the encoder) | chunk width |
+| `cd[2]` | Width of the image a chunk holds | samples |
+| `cd[3]` | Height of the image a chunk holds | samples |
+| `cd[4]` | Components: the low 31 bits are the component count; bit 31 (`0x80000000`) set means planar | see below |
 
 Element types:
 
-| Type | `cd[1]` | | Type | `cd[1]` |
-|------|---------|-|------|---------|
-| uint8  | `0x01` | | int8  | `0x81` |
-| uint16 | `0x02` | | int16 | `0x82` |
-| uint32 | `0x04` | | int32 | `0x84` |
+| Type   | Little-endian | Big-endian | | Type  | Little-endian | Big-endian |
+|--------|---------------|------------|-|-------|---------------|------------|
+| uint8  | `0x01` | | | int8  | `0x81` | |
+| uint16 | `0x02` | `0x102` | | int16 | `0x82` | `0x182` |
+| uint32 | `0x04` | `0x104` | | int32 | `0x84` | `0x184` |
 
-Big-endian types add `0x100` (big-endian uint16 is `0x102`). One-byte types
-never set `0x100`.
+One-byte types never set `0x100`.
 
-Layouts, for a codestream with `C` components of `H` rows and `W` columns:
+Components, for a codestream with `C` components of `H` rows and `W` columns:
 
-| `cd[2]` | Layout | Sample `(row, column, component)` is element |
-|---------|--------|----------------------------------------------|
-| `0` | One component | `row * W + column` |
-| `1` | Components on the last axis, pixel-interleaved (`H W C`) | `(row * W + column) * C + component` |
-| `2` | Components on the first axis that is not 1, planar (`C H W`) | `(component * H + row) * W + column` |
+| `cd[4]` | Where the components are | Sample `(row, column, component)` is element |
+|---------|--------------------------|----------------------------------------------|
+| `0` | No component axis, one component | `row * W + column` |
+| `C` (`1` to `16384`) | On the last axis, pixel-interleaved (`H W C`) | `(row * W + column) * C + component` |
+| `0x80000000 \| C` | On the first axis that is not 1, planar (`C H W`) | `(component * H + row) * W + column` |
 
-One component and "no component axis" are the same bytes: `H * W` samples in
-C order. A layout 1 or 2 chunk whose component axis has size 1 is therefore
-also a valid layout 0 chunk.
+`0x80000000` with a count of 0 is invalid. h5dump and h5py print `cd[4]` as
+an unsigned integer: three planar components, `0x80000003`, appear as
+`2147483651`.
+
+`0` and `1` are the same bytes: `H * W` samples in C order, with no component
+axis or a trailing axis of length 1. `0x80000001`, a leading axis of length 1,
+is also the same bytes.
+
+For example, a `(T, 256, 320)` uint16 dataset chunked `(1, 256, 320)` stores
+`(1, 2, 320, 256, 0)`, and a `(T, 480, 640, 3)` uint8 dataset chunked
+`(1, 480, 640, 3)` stores `(1, 1, 640, 480, 3)`.
 
 Readers:
 
-* use `cd[1]` to write the decoded samples as the dataset's element type, and
-  `cd[2]` to place the components;
-* ignore `cd[3]` and later values; a writer that does not use the filter's
-  encoder may leave them out;
+* need only `cd[0]`, `cd[1]` and `cd[4]`; the image shape comes from the
+  codestream. When `cd[2]` and `cd[3]` are present they are checked against
+  the codestream, and a mismatch fails;
+* accept `cd_values` that stop after `cd[1]` and treat them as one component
+  with no component axis;
 * when the `cd_values` are missing (an older writer), infer the element size
   from the codestream's bit depth, rounded up to 1, 2 or 4 bytes, take the
   signedness from the codestream, and assume little-endian samples and one
-  component;
+  component with no component axis;
+* reject any other number of `cd_values` and any version but 1;
 * clamp decoded samples to the range of both the codestream's bit depth and
   the element type, which matters only for lossy codestreams;
 * reject a codestream whose bit depth does not fit the element type, or whose
-  component count does not match the layout.
+  component count does not match `cd[4]`.
+
+#### Compared with h5z-htj2k
+
+The `cd_values` use the same order and the same element-type coding as the
+h5z-htj2k filter, so files that fit both read the same way. This filter also
+allows 4-byte types (`0x04`, `0x84`, `0x104`, `0x184`), and `cd[4]` adds `0`
+for no component axis and the `0x80000000` flag for planar.
 
 ### Encoder settings
 
@@ -118,19 +135,21 @@ what makes resolution-progressive reads of a chunk possible.
 
 ### `set_local`
 
-When a dataset is created, `set_local` fills the `cd_values` from the
+When a dataset is created, `set_local` fills all five `cd_values` from the
 dataset's type and chunk dimensions:
 
 * Element type: integer types of 1, 2 or 4 bytes. Other types (floating
   point, 8-byte integers, compound types) fail with an error.
-* Layout: 0 when at most two chunk axes are larger than 1. When three are
-  larger than 1, the last one must be the components (layout 1); otherwise
-  dataset creation fails.
-* Values the user passed in `cd[0..2]` are kept when they are consistent with
-  the dataset (version 1, the dataset's element type, and a layout that fits
-  the chunk); inconsistent values fail with an error. Layout 2 is only used
-  when the user asks for it.
-* `cd[3]` and `cd[4]` are always rewritten from the chunk dimensions.
+* Width and height: the two chunk axes larger than 1 besides the component
+  axis (1 when there are fewer).
+* Components: `0` when at most two chunk axes are larger than 1. When three
+  are larger than 1, the last one must be the component axis and `cd[4]` is
+  its length; otherwise dataset creation fails. The planar flag is used only
+  when the user passes it.
+* Values the user passed are kept when they are consistent with the dataset
+  (version 1, the dataset's element type, the chunk's image width and height,
+  and a component axis that fits the chunk); inconsistent values fail with an
+  error.
 
 ### Partial and reduced-resolution reads
 
