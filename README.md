@@ -218,3 +218,8 @@ The tests need h5py and the `ojph` Python package.
 * https://github.com/chafey/HTJ2KResources
 * https://github.com/aous72/OpenJPH
 * https://www.openjpeg.org/
+
+## License
+
+BSD 3-Clause; see [LICENSE.txt](LICENSE.txt). The plugin links libojph, which is
+built from a fork of [OpenJPH](https://github.com/aous72/OpenJPH) (BSD 2-Clause).
