@@ -234,9 +234,18 @@ The plugin is one shared library: `libh5jpeg2000.so` on Linux,
 `libh5jpeg2000.dylib` on macOS and `h5jpeg2000.dll` on Windows. It installs to
 `<prefix>/lib/plugin`, the directory HDF5 searches by default when it is
 installed in the same prefix. Set `HDF5_PLUGIN_INSTALL_DIR` to install it
-elsewhere. Linking `libojph` statically (`-DBUILD_SHARED_LIBS=OFF
--DOJPH_ENABLE_HWY=OFF` when building it) gives a plugin that depends only on
-HDF5 and the C++ runtime.
+elsewhere. Linking `libojph` statically (`-DBUILD_SHARED_LIBS=OFF` when
+building it) gives a plugin that depends only on HDF5 and the C++ runtime.
+
+On x86-64, `libojph` has Google Highway SIMD kernels (decoding, the wavelet
+transforms, the colour transforms and the HT block encoder), compiled for
+SSE4 to AVX-512 and chosen at run time. The CI and release builds for Linux
+x86-64 and Windows x86-64 include them: Highway is built as a static,
+position independent library with `libojph`'s `tools/build_hwy.sh` and
+linked in with `-DOJPH_REQUIRE_HWY=ON`, so the plugin has no run time
+dependency on a Highway library (CI checks this). Linux aarch64 and macOS
+arm64 builds use OpenJPH's other code paths; the Highway kernels are
+x86-only.
 
 To build `libojph`, check out its sources with their submodules and install
 them with CMake. The [build action](.github/actions/build-plugin/action.yml)

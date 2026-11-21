@@ -55,26 +55,42 @@ runs:
       run: |
         echo "revision=$(git -C libojph-src rev-parse HEAD)" >> "$GITHUB_OUTPUT"
         echo "compiler=$(${CXX:-c++} --version 2>/dev/null | head -n 1 | tr -c 'A-Za-z0-9.' '-')" >> "$GITHUB_OUTPUT"
+        if [ "$RUNNER_ARCH" = "X64" ] && [ "$RUNNER_OS" != "macOS" ]; then
+          echo "hwy=1.4.0" >> "$GITHUB_OUTPUT"
+        else
+          echo "hwy=off" >> "$GITHUB_OUTPUT"
+        fi
 
     - name: Restore libojph from the cache
       id: libojph-cache
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: libojph-install
-        key: libojph-${{ runner.os }}-${{ runner.arch }}-${{ steps.libojph.outputs.compiler }}-${{ steps.libojph.outputs.revision }}
+        key: libojph-${{ runner.os }}-${{ runner.arch }}-${{ steps.libojph.outputs.compiler }}-hwy-${{ steps.libojph.outputs.hwy }}-${{ hashFiles('libojph-src/tools/build_hwy.sh') }}-${{ steps.libojph.outputs.revision }}
 
     - name: Build and install libojph
       if: steps.libojph-cache.outputs.cache-hit != 'true'
       shell: bash -el {0}
+      env:
+        HWY_VERSION: ${{ steps.libojph.outputs.hwy }}
       run: |
         if [ "$RUNNER_OS" != "Windows" ]; then export CMAKE_GENERATOR=Ninja; fi
         root="$PWD"
         if [ "$RUNNER_OS" = "Windows" ]; then root="$(cygpath -m "$PWD")"; fi
+        prefix="$root/libojph-install"
+        hwy_options=()
+        if [ "$HWY_VERSION" != "off" ]; then
+          libojph-src/tools/build_hwy.sh "$HWY_VERSION" "$prefix" "$root/hwy-build"
+          hwy_library="$prefix/lib/libhwy.a"
+          if [ "$RUNNER_OS" = "Windows" ]; then hwy_library="$prefix/lib/hwy.lib"; fi
+          hwy_options=(-DOJPH_ENABLE_HWY=ON -DOJPH_REQUIRE_HWY=ON
+                       "-DOJPH_HWY_INCLUDE_DIR=$prefix/include" "-DOJPH_HWY_LIBRARY=$hwy_library")
+        fi
         cmake -S libojph-src -B libojph-build \
           -DCMAKE_BUILD_TYPE=Release \
           -DBUILD_SHARED_LIBS=OFF \
-          -DOJPH_ENABLE_HWY=OFF \
-          -DCMAKE_INSTALL_PREFIX="$root/libojph-install"
+          -DCMAKE_INSTALL_PREFIX="$prefix" \
+          "${hwy_options[@]}"
         cmake --build libojph-build --config Release --parallel
         cmake --install libojph-build --config Release
 
@@ -104,3 +120,22 @@ runs:
         cmake --install build --config Release
         echo "plugin-dir=$root/install/lib/plugin" >> "$GITHUB_OUTPUT"
         ls -l install/lib/plugin
+
+    - name: Check that the plugin needs no Highway library at run time
+      shell: bash -el {0}
+      env:
+        PLUGIN_DIR: ${{ steps.plugin.outputs.plugin-dir }}
+      run: |
+        case "$RUNNER_OS" in
+          Linux) dependencies="$(ldd "$PLUGIN_DIR"/libh5jpeg2000.so)" ;;
+          macOS) dependencies="$(otool -L "$PLUGIN_DIR"/libh5jpeg2000.dylib)" ;;
+          Windows)
+            vswhere="/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
+            dumpbin="$("$vswhere" -latest -find 'VC/Tools/MSVC/**/bin/Hostx64/x64/dumpbin.exe' | head -n 1 | tr -d '\r')"
+            dependencies="$("$dumpbin" /dependents "$PLUGIN_DIR/h5jpeg2000.dll")" ;;
+        esac
+        echo "$dependencies"
+        if echo "$dependencies" | grep -i hwy; then
+          echo "the plugin must not depend on a Highway library at run time" >&2
+          exit 1
+        fi
