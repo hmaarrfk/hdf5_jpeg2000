@@ -1,0 +1,94 @@
+name: Build the plugin
+description: >-
+  Install HDF5, libojph, h5py, CMake and a compiler from conda-forge, and
+  build and install the filter plugin.
+
+inputs:
+  coverage:
+    description: Build the plugin with gcov instrumentation, for a coverage report.
+    default: "false"
+
+outputs:
+  plugin-dir:
+    description: The directory that holds the installed plugin.
+    value: ${{ steps.plugin.outputs.plugin-dir }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install the toolchain from conda-forge
+      uses: mamba-org/setup-micromamba@f457c30a868e4760d3a6fcea5f25dc655b8edf39 # v3.2.1
+      with:
+        environment-name: h5jpeg2000
+        create-args: >-
+          python=3.13
+          hdf5>=2,<3
+          libojph>=1.1.3
+          h5py
+          numpy
+          pytest
+          ojph
+          cmake
+          ninja
+          pkg-config
+          ${{ runner.os != 'Windows' && 'cxx-compiler' || '' }}
+          ${{ inputs.coverage == 'true' && 'gcovr' || '' }}
+        condarc: |
+          channels:
+            - conda-forge
+          channel_priority: strict
+        init-shell: bash
+        cache-environment: true
+        post-cleanup: none
+
+    - name: Build and install the plugin
+      id: plugin
+      shell: bash -el {0}
+      env:
+        COVERAGE: ${{ inputs.coverage }}
+      run: |
+        coverage_options=()
+        if [ "$COVERAGE" = "true" ]; then
+          coverage_options=(-DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS=--coverage -DCMAKE_MODULE_LINKER_FLAGS=--coverage)
+        fi
+        if [ "$RUNNER_OS" != "Windows" ]; then export CMAKE_GENERATOR=Ninja; fi
+        root="$PWD"
+        conda_prefix="$CONDA_PREFIX"
+        if [ "$RUNNER_OS" = "Windows" ]; then
+          root="$(cygpath -m "$PWD")"
+          conda_prefix="$(cygpath -m "$CONDA_PREFIX")/Library"
+        fi
+        cmake -S . -B build \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_PREFIX_PATH="$conda_prefix" \
+          -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=ON \
+          -DCMAKE_INSTALL_PREFIX="$root/install" \
+          "${coverage_options[@]}"
+        cmake --build build --config Release --parallel
+        cmake --install build --config Release
+        echo "plugin-dir=$root/install/lib/plugin" >> "$GITHUB_OUTPUT"
+        ls -l install/lib/plugin
+
+    - name: Check that the plugin links the shared libojph
+      shell: bash -el {0}
+      env:
+        PLUGIN_DIR: ${{ steps.plugin.outputs.plugin-dir }}
+      run: |
+        case "$RUNNER_OS" in
+          Linux)
+            dependencies="$(ldd "$PLUGIN_DIR"/libh5jpeg2000.so)"
+            pattern='libojph\.so.* => /' ;;
+          macOS)
+            dependencies="$(otool -L "$PLUGIN_DIR"/libh5jpeg2000.dylib)"
+            pattern='libojph\..*dylib' ;;
+          Windows)
+            vswhere="/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
+            dumpbin="$("$vswhere" -latest -products "*" -find 'VC/Tools/MSVC/**/bin/Hostx64/x64/dumpbin.exe' | head -n 1 | tr -d '\r')"
+            dependencies="$("$dumpbin" -nologo -dependents "$PLUGIN_DIR/h5jpeg2000.dll")"
+            pattern='ojph.*\.dll' ;;
+        esac
+        echo "$dependencies"
+        if ! echo "$dependencies" | grep -iE "$pattern"; then
+          echo "the plugin must link the shared libojph" >&2
+          exit 1
+        fi

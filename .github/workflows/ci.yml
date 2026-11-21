@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [main, filter-plugin]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build the plugin
+        id: build
+        uses: ./.github/actions/build-plugin # zizmor: ignore[self-repository] actionlint 1.7.12 rejects the $/ form
+
+      - name: Run the tests
+        shell: bash -el {0}
+        env:
+          HDF5_PLUGIN_PATH: ${{ steps.build.outputs.plugin-dir }}
+        run: python -m pytest tests -v
+
+  coverage:
+    name: Coverage (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build the plugin with coverage instrumentation
+        id: build
+        uses: ./.github/actions/build-plugin # zizmor: ignore[self-repository] actionlint 1.7.12 rejects the $/ form
+        with:
+          coverage: "true"
+
+      - name: Run the tests
+        shell: bash -el {0}
+        env:
+          HDF5_PLUGIN_PATH: ${{ steps.build.outputs.plugin-dir }}
+        run: python -m pytest tests -q
+
+      - name: Report coverage
+        shell: bash -el {0}
+        run: |
+          mkdir -p coverage
+          gcovr --root . --object-directory build --filter src/ \
+            --txt coverage/summary.txt --txt-metric line \
+            --html-details coverage/index.html \
+            --print-summary
+          gcovr --root . --object-directory build --filter src/ --txt-metric branch
+          {
+            echo '## Coverage of src/h5jpeg2000.cpp'
+            echo '```'
+            cat coverage/summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the coverage report
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage
+          path: coverage
+          if-no-files-found: error
+
+  lint-workflows:
+    name: Lint workflows
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install actionlint and zizmor
+        uses: mamba-org/setup-micromamba@f457c30a868e4760d3a6fcea5f25dc655b8edf39 # v3.2.1
+        with:
+          environment-name: lint
+          create-args: actionlint zizmor
+          condarc: |
+            channels:
+              - conda-forge
+          init-shell: bash
+          post-cleanup: none
+
+      - name: Run actionlint
+        shell: bash -el {0}
+        run: actionlint
+
+      - name: Run zizmor
+        shell: bash -el {0}
+        run: zizmor --offline .github
