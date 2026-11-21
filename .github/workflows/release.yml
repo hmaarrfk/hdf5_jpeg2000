@@ -59,7 +59,7 @@ jobs:
           name="h5jpeg2000-${TAG}-${PLATFORM}"
           mkdir -p "dist/${name}/plugin"
           cp "$PLUGIN_DIR"/* "dist/${name}/plugin/"
-          cp README.md "dist/${name}/"
+          cp README.md LICENSE.txt "dist/${name}/"
           tar -C dist -czf "dist/${name}.tar.gz" "${name}"
           echo "archive=dist/${name}.tar.gz" >> "$GITHUB_OUTPUT"
           echo "name=${name}" >> "$GITHUB_OUTPUT"

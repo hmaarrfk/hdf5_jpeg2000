@@ -14,7 +14,16 @@ find_package(HDF5 REQUIRED COMPONENTS C)
 find_package(ojph CONFIG REQUIRED)
 
 set(HDF5_PLUGIN_INSTALL_DIR "${CMAKE_INSTALL_LIBDIR}/plugin"
-    CACHE PATH "Directory, absolute or relative to the install prefix, that receives the filter plugin")
+    CACHE STRING "Directory, absolute or relative to the install prefix, that receives the filter plugin")
+
+if(IS_ABSOLUTE "${HDF5_PLUGIN_INSTALL_DIR}")
+  set(_h5jpeg2000_plugin_dir "${HDF5_PLUGIN_INSTALL_DIR}")
+else()
+  set(_h5jpeg2000_plugin_dir "${CMAKE_INSTALL_PREFIX}/${HDF5_PLUGIN_INSTALL_DIR}")
+endif()
+# The run-time search path from the installed plugin to the libraries it links.
+file(RELATIVE_PATH _h5jpeg2000_libdir_from_plugin
+  "${_h5jpeg2000_plugin_dir}" "${CMAKE_INSTALL_FULL_LIBDIR}")
 
 add_library(h5jpeg2000 MODULE src/h5jpeg2000.cpp)
 target_link_libraries(h5jpeg2000 PRIVATE HDF5::HDF5 ojph::ojph)
@@ -27,12 +36,12 @@ else()
   target_compile_options(h5jpeg2000 PRIVATE -Wall -Wextra)
 endif()
 if(APPLE)
-  set_target_properties(h5jpeg2000 PROPERTIES SUFFIX ".dylib" INSTALL_RPATH "@loader_path/..")
+  set_target_properties(h5jpeg2000 PROPERTIES SUFFIX ".dylib" INSTALL_RPATH "@loader_path/${_h5jpeg2000_libdir_from_plugin}")
   target_link_options(h5jpeg2000 PRIVATE
     "LINKER:-exported_symbol,_H5PLget_plugin_type"
     "LINKER:-exported_symbol,_H5PLget_plugin_info")
 elseif(UNIX)
-  set_target_properties(h5jpeg2000 PROPERTIES INSTALL_RPATH "$ORIGIN/..")
+  set_target_properties(h5jpeg2000 PROPERTIES INSTALL_RPATH "$ORIGIN/${_h5jpeg2000_libdir_from_plugin}")
   target_link_options(h5jpeg2000 PRIVATE "LINKER:--exclude-libs,ALL")
 endif()
 
