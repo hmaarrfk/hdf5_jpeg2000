@@ -3,6 +3,11 @@ description: >-
   Install HDF5, h5py, CMake and a compiler from conda-forge, build libojph
   (cached), and build and install the filter plugin.
 
+inputs:
+  coverage:
+    description: Build the plugin with gcov instrumentation, for a coverage report.
+    default: "false"
+
 outputs:
   plugin-dir:
     description: The directory that holds the installed plugin.
@@ -26,6 +31,7 @@ runs:
           ninja
           pkg-config
           ${{ runner.os != 'Windows' && 'cxx-compiler' || '' }}
+          ${{ inputs.coverage == 'true' && 'gcovr' || '' }}
         condarc: |
           channels:
             - conda-forge
@@ -75,7 +81,13 @@ runs:
     - name: Build and install the plugin
       id: plugin
       shell: bash -el {0}
+      env:
+        COVERAGE: ${{ inputs.coverage }}
       run: |
+        coverage_options=()
+        if [ "$COVERAGE" = "true" ]; then
+          coverage_options=(-DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS=--coverage -DCMAKE_MODULE_LINKER_FLAGS=--coverage)
+        fi
         if [ "$RUNNER_OS" != "Windows" ]; then export CMAKE_GENERATOR=Ninja; fi
         root="$PWD"
         conda_prefix="$CONDA_PREFIX"
@@ -86,7 +98,8 @@ runs:
         cmake -S . -B build \
           -DCMAKE_BUILD_TYPE=Release \
           -DCMAKE_PREFIX_PATH="$root/libojph-install;$conda_prefix" \
-          -DCMAKE_INSTALL_PREFIX="$root/install"
+          -DCMAKE_INSTALL_PREFIX="$root/install" \
+          "${coverage_options[@]}"
         cmake --build build --config Release --parallel
         cmake --install build --config Release
         echo "plugin-dir=$root/install/lib/plugin" >> "$GITHUB_OUTPUT"

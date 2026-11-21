@@ -36,20 +36,44 @@ The codec is [OpenJPH](https://github.com/aous72/OpenJPH), through the
 
 A filter callback sees the chunk's bytes and the `cd_values`, never the
 dataset's type or shape. The `cd_values` record what a decoder cannot read
-from the codestream (the element type and where the components are) and the
-image shape the filter's encoder needs.
+from the codestream (the element type and where the components are), the
+image shape the filter's encoder needs, and what a reader can rely on to plan
+partial reads without opening a chunk.
 
 Version 1:
 
 | Index   | Meaning | Values |
 |---------|---------|--------|
 | `cd[0]` | Format version | `1` |
-| `cd[1]` | Element type: `size_in_bytes`, `\| 0x80` if signed, `\| 0x100` if big-endian | see below |
+| `cd[1]` | Element type: `size_in_bytes`, `\| 0x80` if signed, `\| 0x100` if big-endian | see [element types](#element-types) |
 | `cd[2]` | Width of the image a chunk holds | samples |
 | `cd[3]` | Height of the image a chunk holds | samples |
-| `cd[4]` | Components: the low 31 bits are the component count; bit 31 (`0x80000000`) set means planar | see below |
+| `cd[4]` | Components: the low 31 bits are the component count; bit 31 (`0x80000000`) set means planar | see [components](#components) |
+| `cd[5]` | Read flags, a promise about every chunk in the dataset | bit 0: each codestream has a TLM marker; bit 1: tile-parts are split at resolutions, in RLCP order; `0` promises nothing; higher bits are reserved and must be 0 |
+| `cd[6]` | Wavelet kernel, with OpenJPH's numbers | `0` = 9/7 irreversible (`irv97`), `1` = 5/3 reversible (`rev53`), `2` = `rev13`, `3` = `rev12` |
+| `cd[7]` | Number of decompositions (resolution levels minus one) | `0` to `32` |
 
-Element types:
+A list of `cd_values` has 0, 2, 5 or 8 entries; any other length fails.
+
+* **0** (no `cd_values`, an older writer): the element size is inferred from
+  the codestream's bit depth, rounded up to 1, 2 or 4 bytes, the signedness
+  comes from the codestream, and the samples are little-endian with one
+  component and no component axis.
+* **2** (`cd[0..1]`): the given element type, one component and no
+  component axis.
+* **5** (`cd[0..4]`): adds the image shape and the components.
+* **8** (`cd[0..7]`): adds what a reader needs to plan partial reads.
+
+Lists of 2 and 5 values match the h5z-htj2k filter and promise nothing about
+reading in part.
+
+For example, a 256x320 uint16 image encoded `rev12` with 2 decompositions, a
+TLM marker and one tile-part per resolution stores
+`(1, 2, 320, 256, 0, 3, 3, 2)`. A `(T, 480, 640, 3)` uint8 dataset chunked
+`(1, 480, 640, 3)` and written by the filter's encoder stores
+`(1, 1, 640, 480, 3, 3, 1, 3)`.
+
+#### Element types
 
 | Type   | Little-endian | Big-endian | | Type  | Little-endian | Big-endian |
 |--------|---------------|------------|-|-------|---------------|------------|
@@ -57,9 +81,12 @@ Element types:
 | uint16 | `0x02` | `0x102` | | int16 | `0x82` | `0x182` |
 | uint32 | `0x04` | `0x104` | | int32 | `0x84` | `0x184` |
 
-One-byte types never set `0x100`.
+One-byte types never set `0x100`. Any other bit, or a size other than 1, 2
+or 4, fails.
 
-Components, for a codestream with `C` components of `H` rows and `W` columns:
+#### Components
+
+For a codestream with `C` components of `H` rows and `W` columns:
 
 | `cd[4]` | Where the components are | Sample `(row, column, component)` is element |
 |---------|--------------------------|----------------------------------------------|
@@ -75,52 +102,74 @@ an unsigned integer: three planar components, `0x80000003`, appear as
 axis or a trailing axis of length 1. `0x80000001`, a leading axis of length 1,
 is also the same bytes.
 
-For example, a `(T, 256, 320)` uint16 dataset chunked `(1, 256, 320)` stores
-`(1, 2, 320, 256, 0)`, and a `(T, 480, 640, 3)` uint8 dataset chunked
-`(1, 480, 640, 3)` stores `(1, 1, 640, 480, 3)`.
+#### Read flags, kernel and decompositions
 
-Readers:
+`cd[5]`, `cd[6]` and `cd[7]` let a reader plan a partial or reduced-resolution
+read of any chunk, and know how many levels there are and whether they are
+exact, without opening a chunk. The filter itself does not need them to
+decode: it always decodes whole chunks.
 
-* need only `cd[0]`, `cd[1]` and `cd[4]`; the image shape comes from the
-  codestream. When `cd[2]` and `cd[3]` are present they are checked against
-  the codestream, and a mismatch fails;
-* accept `cd_values` that stop after `cd[1]` and treat them as one component
-  with no component axis;
-* when the `cd_values` are missing (an older writer), infer the element size
-  from the codestream's bit depth, rounded up to 1, 2 or 4 bytes, take the
-  signedness from the codestream, and assume little-endian samples and one
-  component with no component axis;
-* reject any other number of `cd_values` and any version but 1;
-* clamp decoded samples to the range of both the codestream's bit depth and
+* `cd[6]` uses OpenJPH's kernel numbers, the values `set_wavelet_kern` takes.
+  `0` and `1` are JPEG 2000's own COD transform codes. `2` (`rev13`) and `3`
+  (`rev12`) are the reversible predict-only kernels, signalled with an ATK
+  marker; their reduced resolutions equal `image[::2**r, ::2**r]` exactly.
+  Other kernels' reduced resolutions are filtered images.
+* `cd[7]` is the number of decompositions, so a chunk holds `cd[7] + 1`
+  resolutions.
+* `cd[5]` bit 0, the TLM marker, is what makes fast partial reads possible:
+  it lists the length of every tile-part in the main header. With bit 1 also
+  set, tile-part `r` of each tile carries resolution `r`, smallest first.
+
+A reader that wants resolution `r` of a chunk, counting from the smallest:
+
+1. reads the first bytes of the chunk, up to the first SOT marker (the main
+   header), with a direct chunk read limited to a byte range (HDF5's
+   sub-chunk reads) or a whole direct chunk read;
+2. takes the tile-part lengths from the TLM marker;
+3. reads only the prefix of the chunk that ends with tile-part `r`;
+4. decodes that prefix with a JPEG 2000 library, skipping
+   `cd[7] - r` resolutions.
+
+#### Readers
+
+The filter, and any other reader:
+
+* needs only `cd[0]`, `cd[1]` and `cd[4]` to decode; the image shape comes
+  from the codestream;
+* checks `cd[2]` and `cd[3]` against the codestream when they are present,
+  and fails on a mismatch;
+* checks `cd[6]` and `cd[7]` against the codestream when they are present
+  (the COD transform and decomposition count, and the ATK marker for `rev13`
+  and `rev12`), and fails on a mismatch;
+* fails when `cd[5]` bit 0 is set and the codestream has no TLM marker, or
+  bit 1 is set and the codestream is not in RLCP order with one tile-part
+  per resolution: a broken promise would make other readers read the wrong
+  bytes;
+* rejects any version but 1;
+* clamps decoded samples to the range of both the codestream's bit depth and
   the element type, which matters only for lossy codestreams;
-* reject a codestream whose bit depth does not fit the element type, or whose
-  component count does not match `cd[4]`.
+* rejects a codestream whose bit depth does not fit the element type, whose
+  component count does not match `cd[4]`, whose components are subsampled or
+  differ in bit depth or signedness, or that OpenJPH reports as damaged (for
+  example, one that ends early).
 
 #### Compared with h5z-htj2k
 
 The `cd_values` use the same order and the same element-type coding as the
 h5z-htj2k filter, so files that fit both read the same way. This filter also
-allows 4-byte types (`0x04`, `0x84`, `0x104`, `0x184`), and `cd[4]` adds `0`
-for no component axis and the `0x80000000` flag for planar.
+allows 4-byte types (`0x04`, `0x84`, `0x104`, `0x184`), `cd[4]` adds `0` for
+no component axis and the `0x80000000` flag for planar, and `cd[5..7]` are
+added for partial reads.
 
-### Encoder settings
+### The filter's encoder
 
-Encoder settings are **not** in the `cd_values`. JPEG 2000 has far more
-options (kernel, quantisation, number of decompositions, code-block size,
-progression order, rate control) than fit in a list of integers, and every
-codec spells them differently. The codestream records what a decoder needs.
-
-Applications that need specific settings encode the codestreams themselves
-and store them with direct chunk writes (`H5Dwrite_chunk`, or
-`dataset.id.write_direct_chunk` in h5py). They may record their settings in a
-dataset attribute; that is outside the filter.
-
-The filter's own encoder is lossless, with fixed settings:
+The filter's encoder writes each chunk with these settings:
 
 | Setting | Value |
 |---------|-------|
-| Wavelet kernel | reversible 5/3 (`rev53`) |
-| Decompositions | `max(1, min(31, floor(log2(max(H, W)))) - 6)` |
+| Wavelet kernel | `cd[6]`; `rev53` (lossless) unless the user passes another |
+| Decompositions | `cd[7]`; `max(1, min(31, floor(log2(max(H, W)))) - 6)` unless the user passes another |
+| Quantisation for `irv97` | OpenJPH's default step size (the filter has no `qstep` value) |
 | Progression order | RLCP (resolution first) |
 | TLM marker | on |
 | Tile-parts | one per resolution |
@@ -129,13 +178,21 @@ The filter's own encoder is lossless, with fixed settings:
 | Multi-component transform | none |
 | Bit depth | the element size in bits, signedness from the type |
 
-The resolution-first progression, the TLM marker and one tile-part per
-resolution let a reader find the bytes of each resolution level, which is
-what makes resolution-progressive reads of a chunk possible.
+It needs 5 or 8 `cd_values`. With 5 it uses `rev53` and the default number
+of decompositions. With any other number, or values that do not describe the
+chunk, encoding fails; HDF5 then stores the chunk unfiltered when the filter
+is optional (h5py's default) and fails the write when it is mandatory.
+
+Other encoder settings (quantisation, code-block size, rate control) are not
+in the `cd_values`. Writers that need them encode the codestreams themselves
+and store them with direct chunk writes (`H5Dwrite_chunk`, or
+`dataset.id.write_direct_chunk` in h5py), with `cd[5..7]` describing what they
+wrote. They may record their settings in a dataset attribute; that is
+outside the filter.
 
 ### `set_local`
 
-When a dataset is created, `set_local` fills all five `cd_values` from the
+When a dataset is created, `set_local` fills all eight `cd_values` from the
 dataset's type and chunk dimensions:
 
 * Element type: integer types of 1, 2 or 4 bytes. Other types (floating
@@ -146,19 +203,21 @@ dataset's type and chunk dimensions:
   are larger than 1, the last one must be the component axis and `cd[4]` is
   its length; otherwise dataset creation fails. The planar flag is used only
   when the user passes it.
+* `cd[5] = 3`, since the filter's encoder writes a TLM marker and one
+  tile-part per resolution; `cd[6] = 1` (`rev53`); `cd[7]` from the default
+  formula.
 * Values the user passed are kept when they are consistent with the dataset
   (version 1, the dataset's element type, the chunk's image width and height,
-  and a component axis that fits the chunk); inconsistent values fail with an
-  error.
+  a component axis that fits the chunk, and valid read flags, kernel and
+  decomposition count); inconsistent values fail with an error.
 
-### Partial and reduced-resolution reads
+### What the filter cannot do
 
 A filter cannot read part of a chunk or a reduced resolution: HDF5 always
 hands a filter the whole stored chunk and expects the whole decoded chunk
-back. Readers that want one resolution level, or a region, read the
-codestream with a direct chunk read (`H5Dread_chunk`, or
-`dataset.id.read_direct_chunk` in h5py) and decode it with a JPEG 2000
-library.
+back. Readers that want one resolution level, or a region, use direct chunk
+reads as described under
+[read flags, kernel and decompositions](#read-flags-kernel-and-decompositions).
 
 ## Building
 
@@ -179,10 +238,9 @@ elsewhere. Linking `libojph` statically (`-DBUILD_SHARED_LIBS=OFF
 -DOJPH_ENABLE_HWY=OFF` when building it) gives a plugin that depends only on
 HDF5 and the C++ runtime.
 
-To build `libojph`, check out
-[`ramonaoptics/ojph`](https://github.com/ramonaoptics/ojph) branch `libojph`
-with its submodules and install it with CMake. The
-[CI workflow](.github/workflows/ci.yml) shows the full sequence.
+To build `libojph`, check out its sources with their submodules and install
+them with CMake. The [build action](.github/actions/build-plugin/action.yml)
+names the repository and branch, and shows the full sequence.
 
 ## Using it
 
@@ -209,18 +267,21 @@ with h5py.File("images.h5", "r") as file:
 From C, `H5Pset_filter(dcpl, 32031, H5Z_FLAG_MANDATORY, 0, NULL)` on a chunked
 dataset creation property list.
 
-To store codestreams encoded with other settings, create the dataset with the
-filter and write each chunk directly:
+To store codestreams encoded with other settings, create the dataset with
+`cd_values` that describe them and write each chunk directly:
 
 ```python
 import ojph
 
 with h5py.File("images.h5", "w") as file:
     dataset = file.create_dataset(
-        "images", shape=images.shape, dtype=images.dtype, chunks=(1, 512, 640), compression=32031
+        "images", shape=images.shape, dtype=images.dtype, chunks=(1, 512, 640),
+        compression=32031, compression_opts=(1, 2, 640, 512, 0, 3, 3, 2),
     )
     for index, image in enumerate(images):
-        codestream = ojph.imwrite_to_memory(image, wavelet="rev12", tlm_marker=True, tileparts_at_resolutions=True)
+        codestream = ojph.imwrite_to_memory(
+            image, wavelet="rev12", num_decompositions=2, tlm_marker=True, tileparts_at_resolutions=True
+        )
         dataset.id.write_direct_chunk((index, 0, 0), bytes(codestream))
 ```
 

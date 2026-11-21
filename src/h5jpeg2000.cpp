@@ -19,18 +19,25 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace {
 
 constexpr H5Z_filter_t jpeg2000_filter_id = 32031;
 constexpr unsigned format_version = 1;
-constexpr unsigned type_size_mask = 0xFF;
+constexpr unsigned type_size_bits = 0xFF;
 constexpr unsigned type_signed = 0x80;
 constexpr unsigned type_big_endian = 0x100;
 constexpr uint32_t components_planar = 0x80000000u;
-constexpr uint32_t components_count_mask = 0x7FFFFFFFu;
-constexpr size_t value_count = 5;
+constexpr uint32_t components_count_bits = 0x7FFFFFFFu;
+constexpr size_t shape_value_count = 5;
+constexpr size_t value_count = 8;
+constexpr uint32_t read_flag_tlm = 0x1;
+constexpr uint32_t read_flag_resolution_tile_parts = 0x2;
+constexpr uint32_t read_flags_known = read_flag_tlm | read_flag_resolution_tile_parts;
+constexpr uint32_t maximum_kernel = ojph::param_cod::OJPH_WAVELET_REV12;
+constexpr uint32_t maximum_decompositions = 32;
 constexpr uint64_t maximum_components = 16384;
 constexpr uint64_t maximum_image_extent = 0xFFFFFFFFu;
 
@@ -80,12 +87,38 @@ class throwing_error_handler : public ojph::message_error {
     }
 };
 
+// OpenJPH reports damaged codestreams it can still partly decode, such as one
+// that ends early, as info messages. They are kept so the filter can fail.
+thread_local std::string codec_report;
+
+class recording_info_handler : public ojph::message_info {
+  public:
+    void operator()(int code, const char *, int, const char *format, ...) override
+    {
+        if (!codec_report.empty())
+            return;
+        char detail[400];
+        va_list arguments;
+        va_start(arguments, format);
+        std::vsnprintf(detail, sizeof(detail), format, arguments);
+        va_end(arguments);
+        char message[512];
+        std::snprintf(message, sizeof(message), "codestream problem 0x%08X: %s", code, detail);
+        codec_report = message;
+    }
+};
+
 throwing_error_handler error_handler;
-std::once_flag error_handler_configured;
+recording_info_handler info_handler;
+std::once_flag handlers_configured;
 
 void configure_codec()
 {
-    std::call_once(error_handler_configured, [] { ojph::configure_error(&error_handler); });
+    std::call_once(handlers_configured, [] {
+        ojph::configure_error(&error_handler);
+        ojph::configure_info(&info_handler);
+    });
+    codec_report.clear();
 }
 
 struct element_type {
@@ -96,9 +129,9 @@ struct element_type {
 
 element_type parse_element_type(unsigned code)
 {
-    if (code & ~(type_size_mask | type_big_endian))
+    if (code & ~(type_size_bits | type_big_endian))
         fail("cd_values[1] = 0x%X has unknown bits set", code);
-    element_type type{code & type_size_mask & ~type_signed, (code & type_signed) != 0,
+    element_type type{code & type_size_bits & ~type_signed, (code & type_signed) != 0,
                       (code & type_big_endian) != 0};
     if (type.size != 1 && type.size != 2 && type.size != 4)
         fail("cd_values[1] = 0x%X: element size %u is not 1, 2 or 4 bytes", code, type.size);
@@ -119,7 +152,7 @@ struct component_word {
 
 component_word parse_component_word(uint32_t word, const char *&reason)
 {
-    component_word components{word & components_count_mask, (word & components_planar) != 0};
+    component_word components{word & components_count_bits, (word & components_planar) != 0};
     reason = nullptr;
     if (components.planar && components.count == 0)
         reason = "cd_values[4] = 0x80000000: the planar flag needs a component count";
@@ -175,6 +208,27 @@ bool image_geometry_from_chunk(const hsize_t *dims, int rank, uint32_t word, ima
         return false;
     }
     return true;
+}
+
+const char *read_values_problem(uint32_t read_flags, uint32_t kernel, uint32_t decompositions)
+{
+    if (read_flags & ~read_flags_known)
+        return "cd_values[5] has reserved bits set; only bits 0 (TLM) and 1 (tile-parts at resolutions) "
+               "are defined";
+    if (kernel > maximum_kernel)
+        return "cd_values[6] must be 0 (irv97), 1 (rev53), 2 (rev13) or 3 (rev12)";
+    if (decompositions > maximum_decompositions)
+        return "cd_values[7], the number of decompositions, must be at most 32";
+    return nullptr;
+}
+
+ojph::ui32 default_decomposition_count(uint64_t height, uint64_t width)
+{
+    uint64_t extent = std::max(height, width);
+    int log2_extent = 0;
+    while ((extent >> (log2_extent + 1)) != 0)
+        ++log2_extent;
+    return static_cast<ojph::ui32>(std::max(1, std::min(31, log2_extent) - 6));
 }
 
 bool element_type_code(hid_t type_id, unsigned &code)
@@ -273,8 +327,23 @@ herr_t set_local(hid_t dcpl_id, hid_t type_id, hid_t space_id)
         return -1;
     }
 
-    unsigned values[value_count] = {format_version, code, static_cast<unsigned>(geometry.width),
-                                    static_cast<unsigned>(geometry.height), word};
+    uint32_t read_flags = given_count >= 6 ? given[5] : read_flags_known;
+    uint32_t kernel = given_count >= 7 ? given[6] : static_cast<uint32_t>(ojph::param_cod::OJPH_WAVELET_REV53);
+    uint32_t decompositions =
+        given_count >= 8 ? given[7] : default_decomposition_count(geometry.height, geometry.width);
+    if (const char *problem = read_values_problem(read_flags, kernel, decompositions)) {
+        FILTER_ERROR(H5E_BADVALUE, "%s", problem);
+        return -1;
+    }
+
+    unsigned values[value_count] = {format_version,
+                                    code,
+                                    static_cast<unsigned>(geometry.width),
+                                    static_cast<unsigned>(geometry.height),
+                                    word,
+                                    read_flags,
+                                    kernel,
+                                    decompositions};
     if (H5Pmodify_filter(dcpl_id, jpeg2000_filter_id, flags, value_count, values) < 0) {
         FILTER_ERROR(H5E_CANTSET, "cannot store the filter's cd_values");
         return -1;
@@ -349,10 +418,89 @@ uint64_t checked_product(uint64_t a, uint64_t b)
     return a * b;
 }
 
+const char *kernel_name(uint32_t kernel)
+{
+    static const char *const names[] = {"irv97", "rev53", "rev13", "rev12"};
+    return kernel <= maximum_kernel ? names[kernel] : "unknown";
+}
+
+uint32_t read_big_endian(const unsigned char *bytes, size_t size)
+{
+    uint32_t value = 0;
+    for (size_t index = 0; index < size; ++index)
+        value = (value << 8) | bytes[index];
+    return value;
+}
+
+struct codestream_layout {
+    bool has_tlm;
+    uint64_t tile_part_count;
+};
+
+codestream_layout scan_codestream(const unsigned char *bytes, size_t size)
+{
+    constexpr uint32_t marker_tlm = 0xFF55;
+    constexpr uint32_t marker_sot = 0xFF90;
+    codestream_layout layout{false, 0};
+    size_t position = 2;
+    while (position + 4 <= size) {
+        uint32_t marker = read_big_endian(bytes + position, 2);
+        if (marker == marker_sot)
+            break;
+        layout.has_tlm = layout.has_tlm || marker == marker_tlm;
+        position += 2 + read_big_endian(bytes + position + 2, 2);
+    }
+    while (position + 12 <= size && read_big_endian(bytes + position, 2) == marker_sot) {
+        ++layout.tile_part_count;
+        uint32_t tile_part_length = read_big_endian(bytes + position + 6, 4);
+        if (tile_part_length == 0)
+            break;
+        position += tile_part_length;
+    }
+    return layout;
+}
+
+void check_read_values(const unsigned cd_values[], ojph::codestream &codestream, const unsigned char *bytes,
+                       size_t size)
+{
+    if (const char *problem = read_values_problem(cd_values[5], cd_values[6], cd_values[7]))
+        fail("%s", problem);
+    ojph::param_cod cod = codestream.access_cod();
+    uint32_t kernel = cod.get_wavelet_kern();
+    if (kernel != cd_values[6])
+        fail("the codestream uses the %s kernel, but cd_values[6] says %s", kernel_name(kernel),
+             kernel_name(cd_values[6]));
+    uint32_t decompositions = cod.get_num_decompositions();
+    if (decompositions != cd_values[7])
+        fail("the codestream has %u decompositions, but cd_values[7] says %u", decompositions, cd_values[7]);
+    if (cd_values[5] == 0)
+        return;
+    codestream_layout layout = scan_codestream(bytes, size);
+    if ((cd_values[5] & read_flag_tlm) && !layout.has_tlm)
+        fail("cd_values[5] promises a TLM marker, but the codestream has none");
+    if (cd_values[5] & read_flag_resolution_tile_parts) {
+        if (std::strcmp(cod.get_progression_order_as_string(), "RLCP") != 0)
+            fail("cd_values[5] promises tile-parts at resolutions in RLCP order, but the codestream's "
+                 "progression order is %s",
+                 cod.get_progression_order_as_string());
+        ojph::param_siz siz = codestream.access_siz();
+        ojph::point extent = siz.get_image_extent();
+        ojph::point tile_offset = siz.get_tile_offset();
+        ojph::size tile_size = siz.get_tile_size();
+        uint64_t tiles_across = (extent.x - tile_offset.x + tile_size.w - 1) / tile_size.w;
+        uint64_t tiles_down = (extent.y - tile_offset.y + tile_size.h - 1) / tile_size.h;
+        uint64_t expected = tiles_across * tiles_down * (decompositions + 1);
+        if (layout.tile_part_count != expected)
+            fail("cd_values[5] promises one tile-part per resolution (%llu), but the codestream has %llu",
+                 static_cast<unsigned long long>(expected),
+                 static_cast<unsigned long long>(layout.tile_part_count));
+    }
+}
+
 size_t decode(size_t cd_nelmts, const unsigned cd_values[], size_t nbytes, size_t *buf_size, void **buf)
 {
-    if (cd_nelmts != 0 && cd_nelmts != 2 && cd_nelmts != value_count)
-        fail("version 1 has 0, 2 or 5 cd_values, the dataset has %zu", cd_nelmts);
+    if (cd_nelmts != 0 && cd_nelmts != 2 && cd_nelmts != shape_value_count && cd_nelmts != value_count)
+        fail("version 1 has 0, 2, 5 or 8 cd_values, the dataset has %zu", cd_nelmts);
     if (cd_nelmts != 0 && cd_values[0] != format_version)
         fail("cd_values[0] = %u; this filter reads version %u", cd_values[0], format_version);
 
@@ -379,7 +527,7 @@ size_t decode(size_t cd_nelmts, const unsigned cd_values[], size_t nbytes, size_
     uint64_t expected_components = 1;
     if (cd_nelmts >= 2)
         type = parse_element_type(cd_values[1]);
-    if (cd_nelmts == value_count) {
+    if (cd_nelmts >= shape_value_count) {
         if (cd_values[2] != geometry.width || cd_values[3] != geometry.height)
             fail("the codestream is %llu wide and %llu high, but cd_values[2] and cd_values[3] say %u by %u",
                  static_cast<unsigned long long>(geometry.width),
@@ -398,6 +546,8 @@ size_t decode(size_t cd_nelmts, const unsigned cd_values[], size_t nbytes, size_
     if (bit_depth > 8 * type.size)
         fail("the codestream's bit depth, %u, does not fit the dataset's %u-byte elements", bit_depth,
              type.size);
+    if (cd_nelmts == value_count)
+        check_read_values(cd_values, codestream, static_cast<const unsigned char *>(*buf), nbytes);
 
     uint64_t sample_count = checked_product(checked_product(geometry.height, geometry.width), geometry.components);
     size_t output_size = static_cast<size_t>(checked_product(sample_count, type.size));
@@ -430,6 +580,8 @@ size_t decode(size_t cd_nelmts, const unsigned cd_values[], size_t nbytes, size_
         }
     }
     codestream.close();
+    if (!codec_report.empty())
+        fail("%s", codec_report.c_str());
 
     H5free_memory(*buf);
     *buf = output.release();
@@ -437,19 +589,19 @@ size_t decode(size_t cd_nelmts, const unsigned cd_values[], size_t nbytes, size_
     return output_size;
 }
 
-ojph::ui32 default_decomposition_count(uint64_t height, uint64_t width)
-{
-    uint64_t extent = std::max(height, width);
-    int log2_extent = 0;
-    while ((extent >> (log2_extent + 1)) != 0)
-        ++log2_extent;
-    return static_cast<ojph::ui32>(std::max(1, std::min(31, log2_extent) - 6));
-}
-
 size_t encode(size_t cd_nelmts, const unsigned cd_values[], size_t nbytes, size_t *buf_size, void **buf)
 {
-    if (cd_nelmts != value_count || cd_values[0] != format_version)
-        fail("encoding needs the %zu version-1 cd_values that the filter's set_local writes", value_count);
+    if ((cd_nelmts != shape_value_count && cd_nelmts != value_count) || cd_values[0] != format_version)
+        fail("encoding needs 5 or 8 version-1 cd_values, as the filter's set_local writes; the dataset has %zu",
+             cd_nelmts);
+    uint32_t kernel = ojph::param_cod::OJPH_WAVELET_REV53;
+    uint32_t decompositions = default_decomposition_count(cd_values[3], cd_values[2]);
+    if (cd_nelmts == value_count) {
+        if (const char *problem = read_values_problem(cd_values[5], cd_values[6], cd_values[7]))
+            fail("%s", problem);
+        kernel = cd_values[6];
+        decompositions = cd_values[7];
+    }
     element_type type = parse_element_type(cd_values[1]);
     const char *reason = nullptr;
     component_word components = parse_component_word(cd_values[4], reason);
@@ -475,9 +627,9 @@ size_t encode(size_t cd_nelmts, const unsigned cd_values[], size_t nbytes, size_
         siz.set_component(component, ojph::point(1, 1), 8 * type.size, type.is_signed);
 
     ojph::param_cod cod = codestream.access_cod();
-    cod.set_reversible(true);
-    cod.set_wavelet_kern(ojph::param_cod::OJPH_WAVELET_REV53);
-    cod.set_num_decomposition(default_decomposition_count(geometry.height, geometry.width));
+    cod.set_reversible(kernel != ojph::param_cod::OJPH_WAVELET_IRV97);
+    cod.set_wavelet_kern(kernel);
+    cod.set_num_decomposition(decompositions);
     cod.set_block_dims(64, 64);
     cod.set_progression_order("RLCP");
     cod.set_color_transform(false);
