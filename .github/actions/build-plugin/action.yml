@@ -131,8 +131,8 @@ runs:
           macOS) dependencies="$(otool -L "$PLUGIN_DIR"/libh5jpeg2000.dylib)" ;;
           Windows)
             vswhere="/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
-            dumpbin="$("$vswhere" -latest -find 'VC/Tools/MSVC/**/bin/Hostx64/x64/dumpbin.exe' | head -n 1 | tr -d '\r')"
-            dependencies="$("$dumpbin" /dependents "$PLUGIN_DIR/h5jpeg2000.dll")" ;;
+            dumpbin="$("$vswhere" -latest -products "*" -find 'VC/Tools/MSVC/**/bin/Hostx64/x64/dumpbin.exe' | head -n 1 | tr -d '\r')"
+            dependencies="$("$dumpbin" -nologo -dependents "$PLUGIN_DIR/h5jpeg2000.dll")" ;;
         esac
         echo "$dependencies"
         if echo "$dependencies" | grep -i hwy; then
